@@ -68,3 +68,6 @@ __pycache__/
 dist/
 builds/
 docs/
+
+# test kdir
+kdir/
