@@ -7,20 +7,20 @@
  *   replace  - find the struct security_hook_list whose function slot equals a symbol
  *              resolved by name and overwrite that slot; the old pointer is kept in
  *              hook->original and the replacement has to call it for pass-through.  The
- *              slot sits in someone else's (SELinux's) entry, so the hook runs at
- *              SELinux's position and a caller LSM that returns non-zero first masks it.
+ *              slot sits in someone else's lsm entry, so the hook runs at
+ *              LSM's position and a caller LSM that returns non-zero first masks it.
  *   insert   - add our OWN struct security_hook_list node at the HEAD of the same hlist
  *              (hook->insert, see KSU_LSM_HOOK_INSERT).  No symbol is resolved, no
  *              original exists to call, and the node runs before every registered LSM,
  *              so it can only add a denial - never suppress one.  On 6.12+ there is no
- *              hlist to insert into, so insert takes over SELinux's slot of the hook in
+ *              hlist to insert into, so insert takes over LSM's slot of the hook in
  *              static_calls_table instead (see ksu_lsm_hook_insert_scall()) and reaches
  *              the displaced function through hook->original.
  *
  * The 6.12+ static-call dispatch is a different mechanism and BOTH shapes are implemented
  * for it: replace patches the entry's hook word and then switches the static call, and
- * insert scans static_calls_table for the SELinux slot of the hook and takes it over -
- * found by the address kallsyms has for `selinux_<member>`, because offsetof() into the
+ * insert scans static_calls_table for the LSM slot of the hook and takes it over -
+ * found by the address kallsyms has for `LSM_<member>`, because offsetof() into the
  * table names the right element only while the kernel's MAX_LSM_COUNT and hook order match
  * the tree this module was compiled against.
  */
@@ -130,7 +130,7 @@ static int ksu_lsm_read_ptr(const void *addr, void *out)
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
 /* ---- insertion into a hook list (hook->insert) -------------------------------
- * SELinux's node lives in selinux_hooks[] __lsm_ro_after_init, hence ksu_patch_text()
+ * lsm's node lives in lsm_hooks[] __lsm_ro_after_init, hence ksu_patch_text()
  * below; our node is writable and becomes reachable only once head->first is patched, so
  * no walk can observe a half-initialised node. */
 
@@ -143,45 +143,29 @@ static int ksu_lsm_read_ptr(const void *addr, void *out)
  * against, and the offset path below cannot tell - a list belonging to ANOTHER hook reports the
  * computed address back, because its entries were linked to it.  Inserting the replacement there
  * means the kernel calls it with another hook's prototype.  What identifies a list is which
- * implementation of `selinux_<member>` its entries hold.  A second matching list is reported
+ * implementation of `lsm_<member>` its entries hold.  A second matching list is reported
  * through @ambiguous_out: the name then does not identify one list, and guessing is not allowed. */
+static int ksu_lsm_entry_owner_name(struct security_hook_list *e, char *namebuf, size_t len)
+{
+    const char *lsm_ptr;
+
+    if (ksu_lsm_read_ptr((const char *)e + offsetof(struct security_hook_list, lsm), &lsm_ptr))
+        return -EFAULT;
+    if (!lsm_ptr || !ksu_lsm_kptr_plausible((const void *)lsm_ptr))
+        return -EINVAL;
+    if (copy_from_kernel_nofault(namebuf, lsm_ptr, len))
+        return -EFAULT;
+    namebuf[len - 1] = '\0';
+    return 0;
+}
+
 static int ksu_lsm_hook_head_by_identity(unsigned long heads_addr, struct ksu_lsm_hook *hook,
                                         struct hlist_head **out, struct hlist_head **ambiguous_out)
 {
-    unsigned long addrs[8];
-    char want[64];
-    int n_addrs, i;
     unsigned long off;
-    void *functable;
 
     *out = NULL;
     *ambiguous_out = NULL;
-
-    snprintf(want, sizeof(want), "selinux_%s", hook->head_name);
-
-    n_addrs = ksu_find_symbol_all(want, addrs, (int)ARRAY_SIZE(addrs));
-    if (n_addrs == (int)ARRAY_SIZE(addrs))
-        pr_warn("lsm_hook: %s: more than %d addresses are named %s - only the first %d are considered\n",
-                hook->head_name, (int)ARRAY_SIZE(addrs), want, n_addrs);
-
-    /* The funtable spelling of the same name as well: under LLVM CFI (< 6.1) a hook table slot
-     * holds the ".cfi_jt" stub rather than the function body, so the exact name alone would never
-     * match on 5.10/5.15.  kCFI has no such stub, and there the two resolve to one address. */
-    functable = ksu_resolve_symbol_for_functable_hook(want);
-    if (functable) {
-        for (i = 0; i < n_addrs; i++) {
-            if ((void *)addrs[i] == functable)
-                break;
-        }
-        if (i == n_addrs && n_addrs < (int)ARRAY_SIZE(addrs))
-            addrs[n_addrs++] = (unsigned long)functable;
-    }
-
-    if (!n_addrs) {
-        pr_warn("lsm_hook: %s: kallsyms has no address named %s, so its list cannot be identified\n",
-                hook->head_name, want);
-        return -ENOENT;
-    }
 
     for (off = 0; off + sizeof(struct hlist_head) <= sizeof(struct security_hook_heads);
          off += sizeof(struct hlist_head)) {
@@ -191,29 +175,41 @@ static int ksu_lsm_hook_head_by_identity(unsigned long heads_addr, struct ksu_ls
         int seen = 0;
 
         for (; e && seen < KSU_LSM_HEAD_SCAN_ENTRIES; seen++) {
+            char namebuf[16];
+            char want[64];
+            unsigned long sym;
             void *fn = NULL;
 
             if (!ksu_lsm_kptr_plausible(e))
-                break;			/* not a kernel address: stop instead of dereferencing */
+                break;
             if (ksu_lsm_read_ptr((const char *)e + hook->hook_offset, &fn))
                 break;
 
-            for (i = 0; i < n_addrs; i++) {
-                if (fn != (void *)addrs[i])
-                    continue;
-                if (*out) {
-                    *ambiguous_out = head;
-                    return 0;
+            if (ksu_lsm_entry_owner_name(e, namebuf, sizeof(namebuf)) == 0) {
+                snprintf(want, sizeof(want), "%.15s_%s", namebuf, hook->head_name);
+                sym = find_kernel_symbol_exact(want);
+                if (!sym) {
+                    void *functable = ksu_resolve_symbol_for_functable_hook(want);
+                    if (functable)
+                        sym = (unsigned long)functable;
                 }
-                *out = head;
-                break;
+
+                if (sym && fn == (void *)sym) {
+                    if (*out) {
+                        *ambiguous_out = head;
+                        return 0;
+                    }
+                    *out = head;
+                    break;
+                }
             }
+
             e = hlist_entry_safe(READ_ONCE(e->list.next), struct security_hook_list, list);
         }
     }
 
-    SUSFS_LOGI("lsm_hook: %s: %d address(es) named %s (functable spelling included) - %s\n",
-            hook->head_name, n_addrs, want, *out ? "list identified" : "no list found");
+    SUSFS_LOGI("lsm_hook: %s: %s\n", hook->head_name ?: "unknown",
+            *out ? "list identified" : "no list found by identity");
 
     return *out ? 0 : -ENOENT;
 }
@@ -450,19 +446,19 @@ static bool ksu_lsm_addr_is_named(void *fn, const char *name, int *n_addrs)
     return false;
 }
 
-static int ksu_lsm_fn_is_selinux_hook(void *fn, const char *member, void *expect)
+static int ksu_lsm_fn_is_owner_hook(void *fn, const char *owner, const char *member)
 {
     char buf[KSYM_SYMBOL_LEN];
     char want[64];
     char *mod = NULL;
     int len, n_addrs = 0;
+    unsigned long expect;
 
-    snprintf(want, sizeof(want), "selinux_%s", member);
+    snprintf(want, sizeof(want), "%.15s_%s", owner, member);
+    expect = find_kernel_symbol_exact(want);
 
     len = ksu_symbol_name_of((unsigned long)fn, buf, &mod);
 
-    /* The name of the address, when it is SELinux's own symbol (a module-owned one is
-     * somebody else's function and is refused below whatever it is called). */
     if (len > 0 && !mod) {
         if (ksu_lsm_name_is(buf, want))
             return 0;
@@ -473,9 +469,6 @@ static int ksu_lsm_fn_is_selinux_hook(void *fn, const char *member, void *expect
         }
     }
 
-    /* The address itself, when it is one kallsyms has for the name we want.  This is what
-     * covers the folded/aliased case above, and it is still a real identity check: the name
-     * has to resolve to this exact pointer. */
     if (!mod && ksu_lsm_addr_is_named(fn, want, &n_addrs)) {
         pr_warn("lsm_hook: %s: %px is %s by address - kallsyms names that address %s; accepting\n",
                 member, fn, want, buf[0] ? buf : "(nothing)");
@@ -498,11 +491,8 @@ static int ksu_lsm_fn_is_selinux_hook(void *fn, const char *member, void *expect
         pr_warn("lsm_hook: %s: %px cannot be named, and this kernel has no address named %s at all\n",
                 member, fn, want);
 
-    /* Nothing named that address, so the identity of the name could not be checked above -
-     * this is the path this function has always had: compare against the address resolved
-     * for `selinux_<member>`, and with nothing to compare against, refuse. */
     if (expect)
-        return (fn == expect) ? 0 : -EINVAL;
+        return (fn == (void *)expect) ? 0 : -EINVAL;
 
     return -ENOSYS;
 }
@@ -537,13 +527,15 @@ static unsigned long ksu_lsm_scalls_end(void)
  * does not look like a slot is skipped rather than reported, because the scan walks elements the
  * previous code never touched.  It does NOT identify the hook - that is the caller's address
  * test. */
-static void ksu_lsm_slot_selinux(struct lsm_static_call *s, struct ksu_lsm_hook *hook,
+static void ksu_lsm_slot_owner(struct lsm_static_call *s, struct ksu_lsm_hook *hook,
                                  struct security_hook_list **hl_out, void **cur_out)
 {
     unsigned long end = ksu_lsm_scalls_end();
     struct security_hook_list *hl;
     void *key, *tramp, *scalls, *lsmid, *namep, *hookfn, *cur;
     char namebuf[16];
+    char want[64];
+    unsigned long sym;
 
     *hl_out = NULL;
     *cur_out = NULL;
@@ -570,13 +562,17 @@ static void ksu_lsm_slot_selinux(struct lsm_static_call *s, struct ksu_lsm_hook 
         copy_from_kernel_nofault(namebuf, namep, 8))
         return;
     namebuf[8] = '\0';
-    if (strncmp(namebuf, "selinux", 8) != 0)
-        return;			/* capability, safesetid, landlock, bpf-lsm, ... */
+
+    snprintf(want, sizeof(want), "%.8s_%s", namebuf, hook->head_name);
+    sym = find_kernel_symbol_exact(want);   /* or ksu_find_symbol_all, matching existing style */
 
     if (ksu_lsm_read_ptr((const char *)key + offsetof(struct static_call_key, func), &cur) ||
         ksu_lsm_read_ptr((const char *)hl + hook->hook_offset, &hookfn) ||
         !cur || !hookfn || cur != hookfn)
-        return;			/* mid-update, or not the shape of a static call */
+        return;
+
+    if (!sym || cur != (void*)sym)
+    return;
 
     *hl_out = hl;
     *cur_out = cur;
@@ -589,14 +585,13 @@ static void ksu_lsm_slot_selinux(struct lsm_static_call *s, struct ksu_lsm_hook 
  * taking over the first match could patch another hook's static call: that hook would then call
  * our function with its own prototype and kCFI would kill the device on its next invocation.  So
  * the second match is reported through @ambiguous_out and the caller refuses instead. */
-static void ksu_lsm_scan_slot(struct ksu_lsm_hook *hook, const unsigned long *addrs, int n_addrs,
+static void ksu_lsm_scan_slot(struct ksu_lsm_hook *hook,
                               struct lsm_static_call **chosen_out,
                               struct security_hook_list **hl_out, void **orig_out,
                               struct lsm_static_call **ambiguous_out, unsigned long *scanned_out)
 {
     unsigned long end = ksu_lsm_scalls_end();
     unsigned long p;
-    int i;
 
     *chosen_out = NULL;
     *hl_out = NULL;
@@ -607,21 +602,11 @@ static void ksu_lsm_scan_slot(struct ksu_lsm_hook *hook, const unsigned long *ad
     for (p = ksu_lsm_scalls_addr; p + sizeof(struct lsm_static_call) <= end;
          p += sizeof(struct lsm_static_call)) {
         struct security_hook_list *hl;
-        bool hit = false;
         void *cur;
 
         (*scanned_out)++;
-        ksu_lsm_slot_selinux((struct lsm_static_call *)p, hook, &hl, &cur);
+        ksu_lsm_slot_owner((struct lsm_static_call *)p, hook, &hl, &cur);
         if (!hl)
-            continue;
-
-        for (i = 0; i < n_addrs; i++) {
-            if (cur == (void *)addrs[i]) {
-                hit = true;
-                break;
-            }
-        }
-        if (!hit)
             continue;
 
         if (*chosen_out) {
@@ -641,11 +626,8 @@ static int ksu_lsm_hook_insert_scall(struct ksu_lsm_hook *hook)
     struct lsm_static_call *chosen = NULL;
     struct security_hook_list *chosen_hl = NULL;
     void *chosen_orig = NULL;
-    unsigned long addrs[8];
     unsigned long scanned = 0;
-    void *expect = NULL;
-    char want[64];
-    int i, n_addrs, ret;
+    int i, ret;
 
     if (!hook->head_name) {
         pr_err("lsm_hook: insert: hook has no head_name, cannot identify its static calls\n");
@@ -662,31 +644,15 @@ static int ksu_lsm_hook_insert_scall(struct ksu_lsm_hook *hook)
                 (void *)ksu_lsm_scalls_addr, (int)KSU_LSM_SLOTS_PER_HOOK);
     }
 
-    snprintf(want, sizeof(want), "selinux_%s", hook->head_name);
-    expect = ksu_resolve_symbol_for_functable_hook(want);
-
-    /* Resolve the addresses kallsyms has for `selinux_<member>` (normally one) and let the scan
-     * below match against them: what the kernel registered is what identifies the slot. */
-    n_addrs = ksu_find_symbol_all(want, addrs, (int)ARRAY_SIZE(addrs));
-    if (n_addrs == (int)ARRAY_SIZE(addrs))
-        pr_warn("lsm_hook: %s: more than %d addresses are named %s - only the first %d are considered\n",
-                hook->head_name, (int)ARRAY_SIZE(addrs), want, n_addrs);
-    if (n_addrs == 0 && expect) {
-        addrs[0] = (unsigned long)expect;
-        n_addrs = 1;
-    }
-
-    if (n_addrs) {
+    {
         struct lsm_static_call *ambiguous = NULL;
 
-        ksu_lsm_scan_slot(hook, addrs, n_addrs, &chosen, &chosen_hl, &chosen_orig, &ambiguous,
-                          &scanned);
+        ksu_lsm_scan_slot(hook, &chosen, &chosen_hl, &chosen_orig, &ambiguous, &scanned);
         if (ambiguous) {
-            pr_err("lsm_hook: insert: %s: elements %lu and %lu both hold a function named %s - the name does not identify one slot here, so taking one over could patch another hook's static call, refusing\n",
+            pr_err("lsm_hook: insert: %s: elements %lu and %lu each hold a function matching their own slot's LSM owner name - more than one usable slot was found, refusing to take one over\n",
                     hook->head_name,
                     (unsigned long)(chosen - (struct lsm_static_call *)ksu_lsm_scalls_addr),
-                    (unsigned long)(ambiguous - (struct lsm_static_call *)ksu_lsm_scalls_addr),
-                    want);
+                    (unsigned long)(ambiguous - (struct lsm_static_call *)ksu_lsm_scalls_addr));
             return -EINVAL;
         }
         if (chosen) {
@@ -695,9 +661,6 @@ static int ksu_lsm_hook_insert_scall(struct ksu_lsm_hook *hook)
                                   (struct lsm_static_call *)ksu_lsm_scalls_addr);
             unsigned long off = hook->head_offset / sizeof(struct lsm_static_call);
 
-            /* Expected on a kernel whose MAX_LSM_COUNT or hook order differs from the tree this
-             * module was built against - which is the whole reason for the scan - so it is said
-             * once rather than once per hook. */
             if (idx != off) {
                 if (!off_mismatch_reported)
                     pr_warn("lsm_hook: %s: its slot is element %lu of static_calls_table while offsetof() names %lu - this kernel's MAX_LSM_COUNT or hook order differs from the tree this module was built against (%d slots per hook assumed); the scan handles it, this is informational for every hook\n",
@@ -707,15 +670,13 @@ static int ksu_lsm_hook_insert_scall(struct ksu_lsm_hook *hook)
                             hook->head_name, idx, off);
                 off_mismatch_reported = true;
             }
-            SUSFS_LOGI("lsm_hook: %s: slot found by identity at element %lu (%d address(es) named %s, %lu elements scanned)\n",
-                    hook->head_name, idx, n_addrs, want, scanned);
+            SUSFS_LOGI("lsm_hook: %s: slot found by identity at element %lu (%lu elements scanned)\n",
+                    hook->head_name, idx, scanned);
         }
     }
 
-    /* Fallback, only when nothing was found by identity: the slot the build-time offset names,
-     * judged by the NAME of the function in it.  That is what this module always did, and it
-     * keeps the case a name-based test can accept working (a vendor wrapper whose name merely
-     * contains the member). */
+    /* Fallback, only when nothing was found by identity: walk every slot and judge each one
+     * by the NAME of the function it currently holds, against whichever LSM owns that slot. */
     slots = (struct lsm_static_call *)(ksu_lsm_scalls_addr + hook->head_offset);
 
     for (i = 0; !chosen && i < KSU_LSM_SLOTS_PER_HOOK; i++) {
@@ -758,26 +719,24 @@ static int ksu_lsm_hook_insert_scall(struct ksu_lsm_hook *hook)
             return -EINVAL;
         }
         namebuf[8] = '\0';
-        if (strncmp(namebuf, "selinux", 8) != 0)
-            continue;	/* capabilities, safesetid, landlock, bpf-lsm, ... */
 
         if (ksu_lsm_read_ptr((const char *)key + offsetof(struct static_call_key, func), &cur) ||
             ksu_lsm_read_ptr((const char *)hl + hook->hook_offset, &hookfn) ||
             !cur || !hookfn) {
-            pr_err("lsm_hook: insert: %s: slot %d (selinux) has no readable current target - refusing\n",
-                    hook->head_name, i);
+            pr_err("lsm_hook: insert: %s: slot %d (%.8s) has no readable current target - refusing\n",
+                    hook->head_name, i, namebuf);
             return -EINVAL;
         }
         if (cur != hookfn) {
-            pr_err("lsm_hook: insert: %s: slot %d (selinux) calls %px while the entry's hook word holds %px - layout mismatch, refusing\n",
-                    hook->head_name, i, cur, hookfn);
+            pr_err("lsm_hook: insert: %s: slot %d (%.8s) calls %px while the entry's hook word holds %px - layout mismatch, refusing\n",
+                    hook->head_name, i, namebuf, cur, hookfn);
             return -EINVAL;
         }
 
-        ret = ksu_lsm_fn_is_selinux_hook(cur, hook->head_name, expect);
+        ret = ksu_lsm_fn_is_owner_hook(cur, namebuf, hook->head_name);
         if (ret) {
-            pr_err("lsm_hook: insert: %s: slot %d (selinux) holds %px, which is not %s (%d) - another owner or a shifted layout, refusing\n",
-                    hook->head_name, i, cur, want, ret);
+            pr_err("lsm_hook: insert: %s: slot %d (%.8s) holds %px, which does not match %.8s_%s (%d) - another owner or a shifted layout, refusing\n",
+                    hook->head_name, i, namebuf, cur, namebuf, hook->head_name, ret);
             return ret == -ENOSYS ? -ENOSYS : -EINVAL;
         }
 
@@ -788,10 +747,9 @@ static int ksu_lsm_hook_insert_scall(struct ksu_lsm_hook *hook)
     }
 
     if (!chosen) {
-        pr_err("lsm_hook: insert: %s: no slot for it among the %lu scanned elements of static_calls_table, and the element offsetof() names (%lu) is not it either (%d address(es) named %s) - refusing\n",
+        pr_err("lsm_hook: insert: %s: no slot for it among the %lu scanned elements of static_calls_table, and the element offsetof() names (%lu) is not it either - refusing\n",
                 hook->head_name, scanned,
-                (unsigned long)(hook->head_offset / sizeof(struct lsm_static_call)),
-                n_addrs, want);
+                (unsigned long)(hook->head_offset / sizeof(struct lsm_static_call)));
         return -ENOENT;
     }
 
@@ -815,7 +773,7 @@ static int ksu_lsm_hook_insert_scall(struct ksu_lsm_hook *hook)
     smp_wmb();
     ksu_lsm_hook_update_scall(chosen, hook->replacement);
 
-    SUSFS_LOGI("lsm_hook: insert via static call slot (selinux, element %lu, %s static call) %s: %px -> %px\n",
+    SUSFS_LOGI("lsm_hook: insert via static call slot (element %lu, %s static call) %s: %px -> %px\n",
             (unsigned long)(chosen - (struct lsm_static_call *)ksu_lsm_scalls_addr),
             chosen->trampoline ? "trampolined" : "key->func",
             hook->head_name, chosen_orig, hook->replacement);

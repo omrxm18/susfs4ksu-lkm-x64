@@ -251,10 +251,10 @@ asmlinkage void susfs_just_return(void);
 
 asm(
     ".pushsection .text, \"ax\"\n"
-    ".type susfs_just_return, @function\n"
     ".globl susfs_just_return\n"
-    ANNOTATE_NOENDBR
+    ".type susfs_just_return, @function\n"
     "susfs_just_return:\n"
+    ANNOTATE_NOENDBR "\n"
     ASM_RET
     ".size susfs_just_return, .-susfs_just_return\n"
     ".popsection\n");
