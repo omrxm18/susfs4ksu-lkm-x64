@@ -57,8 +57,17 @@ static inline bool susfs_ksu_allow_current(void)
  * adds the shell-only check before asking.  Every control node's open/write handler and sus_path's
  * self-protect rules ask this one question, which is what keeps "the nodes are visible" and "su is
  * available" the same set of processes instead of two policies that can drift apart. */
+/* Set by susfs_relabel_control_nodes() only when every control node it found now carries the
+ * ksu_file label.  Until then the nodes keep proc's label, whose policy answers EACCES to the
+ * shell and to su-granted apps (measured on android15-6.6, where the relabel never runs): letting
+ * them past this gate would turn the hidden nodes' ENOENT into an EACCES that proves they exist.
+ * So the KernelSU set applies only to nodes it can actually read, root-only otherwise. */
+extern bool susfs_control_relabelled;
+
 static inline bool susfs_control_visible(void)
 {
+	if (!READ_ONCE(susfs_control_relabelled))
+		return current_uid().val == 0;
 	return susfs_ksu_allow_current();
 }
 

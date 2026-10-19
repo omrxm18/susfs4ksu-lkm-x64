@@ -167,6 +167,8 @@ static void susfs_set_inode_sid(struct inode *inode, u32 sid)
 }
 #endif
 
+bool susfs_control_relabelled;	/* see ksu_allow_gate.h */
+
 static void susfs_relabel_control_nodes(void)
 {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
@@ -174,7 +176,7 @@ static void susfs_relabel_control_nodes(void)
      * default label, and the module's own visibility gate is unaffected. */
     return;
 #else
-    int i, changed = 0;
+    int i, found = 0, changed = 0;
 
     if (!susfs_expose_proc)
         return;
@@ -188,6 +190,7 @@ static void susfs_relabel_control_nodes(void)
 
         if (kern_path(susfs_self_hide_paths[i], 0, &p))
             continue;
+        found++;
         inode = d_inode(p.dentry);
         if (inode && inode->i_security) {
             u32 *field = (u32 *)((char *)inode->i_security +
@@ -203,6 +206,7 @@ static void susfs_relabel_control_nodes(void)
     }
     SUSFS_LOGI("susfs: %d control node(s) relabelled to %s\n",
                changed, susfs_control_selinux_ctx);
+    WRITE_ONCE(susfs_control_relabelled, changed > 0 && changed == found);
 #endif
 }
 
