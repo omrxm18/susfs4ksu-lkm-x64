@@ -73,6 +73,11 @@
 #define COMPAT_LINKAT_NR	0
 #endif
 
+// The enum was moved to namei.c in 7.2.0 so it's no longer accessible
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
+enum last_type {LAST_NORM, LAST_ROOT, LAST_DOT, LAST_DOTDOT};
+#endif
+
 /* inode_permission() grew a mount-namespace argument in 5.12 and an idmap in 6.3.
  * The call below exists only to match the work an absent name does (may_create's
  * permission check), so the argument that changed is the one the caller cannot
