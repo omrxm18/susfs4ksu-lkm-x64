@@ -15,11 +15,13 @@ Write commands **return `len` on success, a negative errno on failure**.
 |---|---|---|
 | [`/proc/susfs_kstat`](#procsusfs_kstat) | spoof `stat()`/`maps` results | `add_sus_kstat` / `add_sus_kstat_statically` / `update_sus_kstat` / `update_sus_kstat_full_clone` / `del` / `clear` |
 | [`/proc/susfs_open_redirect`](#procsusfs_open_redirect) | redirect `open()` (with the reverse side: `d_path`/`statfs`/`maps`/`fdinfo`) | `add_open_redirect` / `del` / `clear` |
+| [`/proc/susfs_uname_machine`](#procsusfs_uname_machine) | spoof the `uname()` `machine` field for translated arm64 processes | `set <machine> <marker path>` / `clear` |
 | [`/proc/susfs_enable_log`](#procsusfs_enable_log) | runtime log switch | `0` / `1` |
 | [`/proc/susfs_avc_spoof`](#procsusfs_avc_spoof) | hide KernelSU traces in the SELinux AVC audit log | `0` / `1` |
 | [`/proc/susfs_hide_modules`](#procsusfs_hide_modules) | drop **other kernel modules** from `/proc/modules` by name | `add <name>` / `del <name>` / `set <name>…` / `clear` |
 | [`/proc/susfs_hide_mounts`](#procsusfs_hide_mounts) | which mounts count as "ours" (the set of mounts to hide) | `add <prefix>` / `del <prefix>` / `set <prefix>…` / `reset` / `clear` |
 | [`/proc/susfs_path`](#procsusfs_path) | the sus_path rule table -- **`cat` is the listing** | `add <path>` / `del <path>` / `clear` |
+| [`/proc/susfs_map`](#procsusfs_map) | hide the mapped real file by inode (`maps`/`smaps`/`smaps_rollup`/`map_files`/`pagemap`) | `add <path>` / `del <path>` / `clear` |
 | [`/proc/susfs_opath`](#procsusfs_opath) | self-check of the `open(..., O_PATH)` coverage on hidden paths | -- (read-only; two parameters `opath_test` / `opath_dump`) |
 
 The nodes are created only when sus_path's LSM layer is installed.
@@ -106,17 +108,24 @@ hooks: forward=0 dpath=0 statfs=0 maps=0 fdinfo=0 | rev hits: dpath=0 statfs=0 m
 ```sh
 echo "add_open_redirect <target> <redirected-to file> <uid_scheme>" > /proc/susfs_open_redirect
 echo "add_open_redirect <target> <redirected-to file> <uid_scheme> no_reverse" > /proc/susfs_open_redirect
+echo "add_open_redirect <target> <redirected-to file> <uid_scheme> app_only" > /proc/susfs_open_redirect
+echo "add_open_redirect <target> <redirected-to file> <uid_scheme> no_reverse app_only" > /proc/susfs_open_redirect
+echo "add_open_redirect <target> <redirected-to file> <uid_scheme> no_reverse app_only keep_ident" > /proc/susfs_open_redirect
 echo "del <target>"                                                 > /proc/susfs_open_redirect
 echo clear                                                          > /proc/susfs_open_redirect
 ```
 
-`no_reverse` (optional fifth token, since v0.0.7, this port only): the open is still redirected, but the reverse spoofing below is skipped for that rule, for every process. **A `no_reverse` rule is a rename, not a hide**: every app sees the redirected-to name in `maps`, fd links, fdinfo and `statfs()`. Its listing line carries ` no_reverse` after `uid=N`:
+`no_reverse` (optional token 5 or 6, since v0.0.7, this port only): the open is still redirected, but the reverse spoofing below is skipped for that rule, for every process. **A `no_reverse` rule is a rename, not a hide**: every app sees the redirected-to name in `maps`, fd links, fdinfo and `statfs()`. Its listing line carries ` no_reverse` after `uid=N`:
 
 ```
 /dev/goldfish_address_space -> /dev/gpu_as0 uid=2 no_reverse (ino=780 dev=18 mnt=36 | rev: ino=822 dev=18)
 ```
 
-Any other fifth token returns `-EINVAL` and registers nothing. Builds before v0.0.7 reject every five-token write with `-EINVAL`, so a caller can try the flagged write and fall back. Adding the same target again replaces the rule, so a re-add without `no_reverse` clears the flag. The supercall (`ksu_susfs`) has no field for it and always adds a normal rule; use `/proc` or this module's `susfs add_open_redirect <target> <redirected> <uid_scheme> [no_reverse]`.
+`app_only` (optional token 5 or 6, this port only): the forward redirect applies only when the opening process's executable is `/system/bin/app_process64` or `/system/bin/app_process32`. The comparison is by inode number and device, not by path. A process with no `mm` or no `exe_file` does not match, and neither does a program an app starts with `execve` (its exe is different), so the original open runs there. The app_process inodes are resolved with `kern_path()` when the first `app_only` rule is added. A file that does not exist is skipped; if neither exists the add fails with `-ENOENT` and registers nothing. If the kernel has no `get_mm_exe_file` symbol the add fails with `-EOPNOTSUPP`. Builds without `app_only` reject the token with `-EINVAL`, so a caller can try it and fall back. Reverse spoofing is not affected. Its listing line carries ` app_only`.
+
+`keep_ident` (optional token 5, 6 or 7, this port only): a file this rule opened for a caller reports the target's `st_dev` and `st_ino` instead of the redirected-to file's, so `fstat()` on the fd agrees with `stat()` on the path. No other field changes. It covers `fstat(fd)`, `newfstatat`/`statx` with `AT_EMPTY_PATH` on the fd, and `newfstatat`/`statx` following `/proc/self/fd/N`, `/proc/thread-self/fd/N`, `/proc/<own tgid>/fd/N` or the `/task/<own tid>/fd/N` form of those, O_PATH fds included. `readlinkat` of those same `/proc` names returns the path the caller's own open resolved to, cut to the buffer size the way `readlink` cuts it. A `/proc` name is rewritten only when the call returned that file's real identity or link. Other opens of the redirected-to file, the 32-bit (compat) stat and readlink calls, the legacy `readlink` syscall, `/proc` fds of other processes and names relative to a dirfd are not changed. There is no uid gate: isolated processes see it too. The module keeps a reference on each served file, so the file's final release (and its `IN_CLOSE_NOWRITE`) happens when the module drops the entry: on the next served open after nothing else holds the file, or when the rule is deleted, replaced without `keep_ident`, or cleared. At most 512 served files are listed at once; a file served while the table is full keeps its own identity. Its listing line carries ` keep_ident`, and the listing ends with `keep_ident: listed=<now> tracked=<total> hits=<lookups that matched> full=<not listed, table full>`. `/proc/susfs_kstat` shows `keep_ident: rw=<stat rewrites> uacc=<write faults> link=<readlink rewrites>`.
+
+Tokens 5 to 7 accept `no_reverse`, `app_only` and `keep_ident`, in any order, each at most once. Any other token, or a duplicate, returns `-EINVAL` and registers nothing. Builds before v0.0.7 reject every five-token write with `-EINVAL`, so a caller can try the flagged write and fall back. Adding the same target again replaces the rule, so a re-add without the flags clears them. The supercall (`ksu_susfs`) has no field for these flags and always adds a normal rule; use `/proc` or this module's `susfs add_open_redirect <target> <redirected> <uid_scheme> [no_reverse] [app_only] [keep_ident]`.
 
 `uid_scheme` takes `0..4`; out of range is refused at the `add` stage (`-EINVAL`):
 
@@ -129,6 +138,34 @@ Any other fifth token returns `-EINVAL` and registers nothing. Builds before v0.
 | 4 | gets umounted, regardless of uid |
 
 The reverse spoofing (`d_path()` / `statfs()` / fdinfo / `maps`) does **not** look at the rule's `uid_scheme`: the decision only looks at "will this process be umounted", so **a scheme-0 rule still does reverse spoofing for app processes**.
+
+---
+
+## /proc/susfs_uname_machine
+
+Spoof the `machine` field of `uname()` for processes that run translated arm64 code.
+
+Under a binary translator (this x86_64 image) an arm64 app's native code reads the host's `uname()` result, so `machine` says `x86_64` while Java's `os.arch` in the same app says `aarch64`. This node makes `machine` read as the given string for the translated processes only, so x86_64 apps, root and `adb shell` keep the real value. A process is translated when one of its memory mappings is backed by the marker file: every translated arm64 app maps `/system/bin/arm64/linker64`, the others do not. The match is the marker's inode number and superblock device, resolved when the command is written.
+
+**Read**: one line with the state, or the off line:
+
+```
+machine=aarch64 marker=/system/bin/arm64/linker64 (ino=780 dev=18) spoofed=3
+machine spoof: off
+```
+
+`spoofed` counts the calls whose `machine` field was rewritten.
+
+**Write**:
+
+```sh
+echo "set aarch64 /system/bin/arm64/linker64" > /proc/susfs_uname_machine
+echo clear                                     > /proc/susfs_uname_machine
+```
+
+`set` takes the machine string and the marker path. The string must be non-empty, at most 64 bytes, and contain no whitespace or control characters; the path is resolved at once, and a path that does not resolve is refused with `-ENOENT`. A second `set` replaces the first. `clear` turns the spoof off. Anything else returns `-EINVAL`.
+
+The release/version spoof (`CMD_SUSFS_SET_UNAME`) and this one are independent: each is on or off on its own, and the `newuname` hook is registered while either is on. The rewrite happens before the syscall returns to user space; a call whose work item cannot be allocated is left unspoofed.
 
 ---
 
@@ -202,6 +239,7 @@ The sus_path rule table; writes are commands:
 cat /proc/susfs_path
 # hide_from_apps=1  enoent: getattr=5 perm=0 nameop=0 meta=0
 # dirent: rewrite-fail=0  all-hidden=0  pending=0  calls(l64=2 compat=0)
+# exempt: full=0  (redirect opens that ran without the exemption)
 # identity: 3 hit(s) where the inode pointer did not match and (dev,ino) or (fs type,ino) answered instead
 # path=/proc/susfs_kstat  dev=20 ino=4026535246 name=susfs_kstat  [ours: clear/del refuse it]
 # path=/data/adb/xxx      dev=253 ino=1234567 name=xxx
@@ -230,3 +268,24 @@ This module makes the **path name** invisible (`ENOENT`), but does not block cha
 ```sh
 ksu_susfs add_open_redirect <target> <redirected> <uid_scheme>   # uid_scheme: 0..4
 ```
+
+## /proc/susfs_map
+
+Hides the mapped real file by inode from `/proc/<pid>/maps`, `smaps`, `smaps_rollup`, `map_files`, and `pagemap`; the rules are the same set as the reboot(2) supercall `CMD_SUSFS_ADD_SUS_MAP`.
+
+**Read**:
+
+```text
+rules: 1/64
+ino=123456 dev=65099
+```
+
+**Write**:
+
+```sh
+echo "add /system/lib64/libfoo.so" > /proc/susfs_map
+echo "del /system/lib64/libfoo.so" > /proc/susfs_map
+echo clear > /proc/susfs_map
+```
+
+`add` resolves the path (following symlinks) and registers its inode; `del` resolves the same path and removes the matching rule; `clear` drops all rules. 

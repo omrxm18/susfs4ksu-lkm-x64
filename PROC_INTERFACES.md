@@ -15,11 +15,13 @@
 |---|---|---|
 | [`/proc/susfs_kstat`](#procsusfs_kstat) | `stat()`/`maps` 结果伪装 | `add_sus_kstat` / `add_sus_kstat_statically` / `update_sus_kstat` / `update_sus_kstat_full_clone` / `del` / `clear` |
 | [`/proc/susfs_open_redirect`](#procsusfs_open_redirect) | `open()` 重定向（含反向面：`d_path`/`statfs`/`maps`/`fdinfo`） | `add_open_redirect` / `del` / `clear` |
+| [`/proc/susfs_uname_machine`](#procsusfs_uname_machine) | 对翻译运行的 arm64 进程伪装 `uname()` 的 `machine` | `set <machine> <标记路径>` / `clear` |
 | [`/proc/susfs_enable_log`](#procsusfs_enable_log) | 运行期日志开关 | `0` / `1` |
 | [`/proc/susfs_avc_spoof`](#procsusfs_avc_spoof) | 隐藏 SELinux AVC 审计日志 | `0` / `1` |
 | [`/proc/susfs_hide_modules`](#procsusfs_hide_modules) | 按名字把**其它内核模块**从 `/proc/modules` 去掉 | `add <名字>` / `del <名字>` / `set <名字>…` / `clear` |
 | [`/proc/susfs_hide_mounts`](#procsusfs_hide_mounts) | 哪些挂载算"我们的"（决定隐藏的挂载集合） | `add <前缀>` / `del <前缀>` / `set <前缀>…` / `reset` / `clear` |
 | [`/proc/susfs_path`](#procsusfs_path) | sus_path 规则表——**`cat` 就是清单** | `add <路径>` / `del <路径>` / `clear` |
+| [`/proc/susfs_map`](#procsusfs_map) | 按 inode 隐藏 mmap 的 real file（`maps`/`smaps`/`smaps_rollup`/`map_files`/`pagemap`） | `add <路径>` / `del <路径>` / `clear` |
 | [`/proc/susfs_opath`](#procsusfs_opath) | `open(..., O_PATH)` 在隐藏路径上的覆盖自检 | —（只读；两个参数 `opath_test` / `opath_dump`） |
 
 节点只在 sus_path 的 LSM 层装上时才创建。
@@ -106,17 +108,24 @@ hooks: forward=0 dpath=0 statfs=0 maps=0 fdinfo=0 | rev hits: dpath=0 statfs=0 m
 ```sh
 echo "add_open_redirect <目标> <被重定向到的文件> <uid_scheme>" > /proc/susfs_open_redirect
 echo "add_open_redirect <目标> <被重定向到的文件> <uid_scheme> no_reverse" > /proc/susfs_open_redirect
+echo "add_open_redirect <目标> <被重定向到的文件> <uid_scheme> app_only" > /proc/susfs_open_redirect
+echo "add_open_redirect <目标> <被重定向到的文件> <uid_scheme> no_reverse app_only" > /proc/susfs_open_redirect
+echo "add_open_redirect <目标> <被重定向到的文件> <uid_scheme> no_reverse app_only keep_ident" > /proc/susfs_open_redirect
 echo "del <目标>"                                               > /proc/susfs_open_redirect
 echo clear                                                      > /proc/susfs_open_redirect
 ```
 
-`no_reverse`（可选的第五个参数，v0.0.7 起，仅本移植版）：open 仍被重定向，但该规则对所有进程都跳过下面的反向伪装。**`no_reverse` 规则是改名，不是隐藏**：所有 app 在 `maps`、fd 链接、fdinfo 和 `statfs()` 里看到的都是被重定向到的名字。列表行在 `uid=N` 后带 ` no_reverse`：
+`no_reverse`（可选的第五或第六个参数，v0.0.7 起，仅本移植版）：open 仍被重定向，但该规则对所有进程都跳过下面的反向伪装。**`no_reverse` 规则是改名，不是隐藏**：所有 app 在 `maps`、fd 链接、fdinfo 和 `statfs()` 里看到的都是被重定向到的名字。列表行在 `uid=N` 后带 ` no_reverse`：
 
 ```
 /dev/goldfish_address_space -> /dev/gpu_as0 uid=2 no_reverse (ino=780 dev=18 mnt=36 | rev: ino=822 dev=18)
 ```
 
-第五个参数是其他任何值都返回 `-EINVAL`，且不注册任何东西。v0.0.7 之前的版本对所有五个参数的写入都返回 `-EINVAL`，所以调用方可以先试带标志的写入，失败再回退。对同一目标再次添加会替换该规则，不带 `no_reverse` 重新添加即清除该标志。supercall（`ksu_susfs`）没有对应字段，总是添加普通规则；请用 `/proc` 或本模块的 `susfs add_open_redirect <target> <redirected> <uid_scheme> [no_reverse]`。
+`app_only`（可选的第 5 或第 6 个参数，仅本移植版）：只在该进程的可执行文件是 `/system/bin/app_process64` 或 `/system/bin/app_process32` 时才做正向重定向，比较 inode 号和设备号，不看路径。没有 `mm` 或没有 `exe_file` 的进程不命中；app 用 `execve` 启动的程序也不命中（它的 exe 不同），照常执行原来的 open。app_process 的 inode 在添加第一条 `app_only` 规则时用 `kern_path()` 解析；不存在的文件直接跳过，两个都不存在时添加返回 `-ENOENT`，不注册任何东西。内核没有 `get_mm_exe_file` 符号时添加返回 `-EOPNOTSUPP`。不支持 `app_only` 的版本对该参数返回 `-EINVAL`，调用方可以先试再回退。反向伪装不受影响。列表行带 ` app_only`。
+
+`keep_ident`（可选的第 5、6 或 7 个参数，仅本移植版）：该规则替调用方打开的文件，报告目标文件的 `st_dev` 和 `st_ino`，而不是被重定向到的文件的，使 fd 上的 `fstat()` 与路径上的 `stat()` 一致。其他字段不变。覆盖 `fstat(fd)`、对该 fd 使用 `AT_EMPTY_PATH` 的 `newfstatat`/`statx`，以及跟随 `/proc/self/fd/N`、`/proc/thread-self/fd/N`、`/proc/<自身 tgid>/fd/N` 或其 `/task/<自身 tid>/fd/N` 形式的 `newfstatat`/`statx`，包括 O_PATH fd。对同样这些 `/proc` 路径的 `readlinkat` 返回调用方自己的 open 解析到的路径，按缓冲区大小截断，与 `readlink` 一致。`/proc` 路径只在调用返回的正是该文件真实身份或链接时才改写。被重定向到的文件的其他 open、32 位（compat）stat 和 readlink 调用、旧的 `readlink` 系统调用、其他进程的 `/proc` fd、相对 dirfd 的路径都不改。没有 uid 门槛：隔离进程同样生效。模块对每个被服务的文件持有一个引用，所以文件的最终释放（以及它的 `IN_CLOSE_NOWRITE`）发生在模块丢弃该条目时：在没有其他持有者之后的下一次被服务的 open，或规则被删除、被不带 `keep_ident` 的规则替换、被清空时。最多同时记录 512 个被服务的文件；表满时被服务的文件保持自己的身份。列表行带 ` keep_ident`，列表末尾有 `keep_ident: listed=<当前> tracked=<累计> hits=<命中的查询> full=<因表满未记录>`。`/proc/susfs_kstat` 显示 `keep_ident: rw=<stat 改写次数> uacc=<写入失败> link=<readlink 改写次数>`。
+
+第 5 到第 7 个参数只接受 `no_reverse`、`app_only` 和 `keep_ident`，顺序任意，每个最多一次；其他任何值或重复都返回 `-EINVAL`，且不注册任何东西。v0.0.7 之前的版本对所有五个参数的写入都返回 `-EINVAL`，所以调用方可以先试带标志的写入，失败再回退。对同一目标再次添加会替换该规则，不带标志重新添加即清除这些标志。supercall（`ksu_susfs`）没有对应字段，总是添加普通规则；请用 `/proc` 或本模块的 `susfs add_open_redirect <target> <redirected> <uid_scheme> [no_reverse] [app_only] [keep_ident]`。
 
 `uid_scheme` 取值 `0..4`，越界在 `add` 阶段直接拒绝（`-EINVAL`）：
 
@@ -129,6 +138,34 @@ echo clear                                                      > /proc/susfs_op
 | 4 | 会被 umount，不看 uid |
 
 反向伪装（`d_path()` / `statfs()` / fdinfo / `maps`）**不看**规则的 `uid_scheme`：判定只看"这个进程会不会被 umount"，所以 **scheme 0 的规则对 app 进程同样做反向伪装**。
+
+---
+
+## /proc/susfs_uname_machine
+
+只对运行翻译后 arm64 代码的进程伪装 `uname()` 的 `machine` 字段。
+
+在二进制翻译下（本 x86_64 镜像），arm64 app 的原生代码读到的是宿主 `uname()` 的结果，`machine` 是 `x86_64`，而同一 app 里 Java 的 `os.arch` 是 `aarch64`。这个节点只对这类翻译进程把 `machine` 改成给定字符串，x86_64 app、root 和 `adb shell` 仍读到真实值。判定方式是该进程有一处内存映射由标记文件支撑：每个翻译运行的 arm64 app 都映射 `/system/bin/arm64/linker64`，其他进程不映射。匹配用的是标记文件的 inode 号与超级块设备号，在写入命令时解析。
+
+**读**：一行状态，或未开启时的一行：
+
+```
+machine=aarch64 marker=/system/bin/arm64/linker64 (ino=780 dev=18) spoofed=3
+machine spoof: off
+```
+
+`spoofed` 是被改写的调用次数。
+
+**写**：
+
+```sh
+echo "set aarch64 /system/bin/arm64/linker64" > /proc/susfs_uname_machine
+echo clear                                     > /proc/susfs_uname_machine
+```
+
+`set` 后跟 machine 字符串和标记路径。字符串不能为空、最长 64 字节、不含空白或控制字符；路径当场解析，解析不了返回 `-ENOENT`。再次 `set` 覆盖前一次。`clear` 关掉伪装。其他任何写法返回 `-EINVAL`。
+
+release/version 伪装（`CMD_SUSFS_SET_UNAME`）与这一项互相独立：各自单独开关，只要还有一个开着，`newuname` 钩子就保持注册。改写发生在系统调用返回用户态之前；分配不到工作项的调用保持原值。
 
 ---
 
@@ -202,6 +239,7 @@ sus_path 的规则表，写是命令：
 cat /proc/susfs_path
 # hide_from_apps=1  enoent: getattr=5 perm=0 nameop=0 meta=0
 # dirent: rewrite-fail=0  all-hidden=0  pending=0  calls(l64=2 compat=0)
+# exempt: full=0  (redirect opens that ran without the exemption)
 # identity: 3 hit(s) where the inode pointer did not match and (dev,ino) or (fs type,ino) answered instead
 # path=/proc/susfs_kstat  dev=20 ino=4026535246 name=susfs_kstat  [ours: clear/del refuse it]
 # path=/data/adb/xxx      dev=253 ino=1234567 name=xxx
@@ -230,3 +268,24 @@ echo clear               > /proc/susfs_path     # 清掉所有**普通**规则
 ```sh
 ksu_susfs add_open_redirect <target> <redirected> <uid_scheme>   # uid_scheme: 0..4
 ```
+
+## /proc/susfs_map
+
+按 inode 把 mmap 的 real file 从 `/proc/<pid>/maps`、`smaps`、`smaps_rollup`、`map_files`、`pagemap` 里隐藏；与 reboot(2) supercall 的 `CMD_SUSFS_ADD_SUS_MAP` 是同一组规则。
+
+**读**：
+
+```text
+rules: 1/64
+ino=123456 dev=65099
+```
+
+**写**：
+
+```sh
+echo "add /system/lib64/libfoo.so" > /proc/susfs_map
+echo "del /system/lib64/libfoo.so" > /proc/susfs_map
+echo clear > /proc/susfs_map
+```
+
+`add` 解析路径（跟随符号链接）并登记 inode；`del` 解析同一路径后删除匹配项；`clear` 清空。

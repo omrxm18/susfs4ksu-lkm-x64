@@ -99,6 +99,11 @@ static const struct susfs_import susfs_imports[] = {
      * by-name lookups (its two companions fget_raw/close_fd_get_file are resolved at runtime
      * and therefore never appear here). */
     IMP(fput),
+    /* prop_view: opens the copy file at add time and maps it at swap time. */
+    IMP(filp_open),
+    IMP(vm_mmap),
+    IMP(override_creds),
+    IMP(revert_creds),
     IMP(task_work_add),
 #ifdef __aarch64__
     /* arm64's set_fixmap macro bottoms out in the global __set_fixmap. */
@@ -143,12 +148,21 @@ static const struct susfs_import susfs_imports[] = {
     IMP(_raw_spin_lock_irqsave),
     IMP(_raw_spin_unlock),
     IMP(_raw_spin_unlock_irqrestore),
+    /* mmap_read_lock()/mmap_read_unlock() in susfs_uname.c's machine callback bottom out in these
+     * two rwsem entry points. */
+    IMP(down_read),
+    IMP(up_read),
     IMP(__rcu_read_lock),
     IMP(__rcu_read_unlock),
     IMP(__put_cred),
     IMP(strnlen_user),
     IMP(___ratelimit),
+    /* copy_to_user()'s check_object_size() is an empty inline without this option, so the
+     * out-of-line helper is neither referenced nor present, and listing it unconditionally
+     * makes this guard the unresolved symbol it exists to catch. */
+#ifdef CONFIG_HARDENED_USERCOPY
     IMP(__check_object_size),
+#endif
     IMP(queue_delayed_work_on),
     IMP(cancel_delayed_work_sync),
     IMP(delayed_work_timer_fn),

@@ -39,6 +39,11 @@ int susfs_imports_guard(void);
  * pointers); the attribute belongs on the definition, so it is not repeated here. */
 int susfs_imports_crosscheck(void);
 
+/* Wait until no task can still be inside a window it entered before this call - a kprobe
+ * handler, or boot_config_proc_show()'s seq_puts().  synchronize_rcu() is NOT enough for
+ * either (neither runs in an RCU read-side section); see lsm_hook.c.  Sleeps. */
+void susfs_wait_for_readers(void);
+
 /* Add a path to sus_path's hidden set from kernel code (no supercall needed); returns 0 or negative errno. */
 int sus_path_add_hidden(const char *path);
 
@@ -49,6 +54,14 @@ int sus_path_add_self_hidden(const char *path);
 /* Undo sus_path_add_self_hidden(): drops the rule for @path and restores whatever it changed (the relaxed mode, the inode
  * reference); returns the number of rules removed, so 0 means "was not registered".  Process context only (iput). */
 int sus_path_del_path(const char *path);
+
+/* open_redirect's own open of a rule's target must not be answered by sus_path's hidden set: the copy it opens can be
+ * registered (NoEmulator's /dev/.prop_view is), and the redirect runs in the app's process context, so the hiding would
+ * turn the redirect into ENOENT for the app.  These bracket exactly that one filp_open(): begin claims a per-task slot
+ * (false when all slots are busy, in which case the open simply runs with the hiding in effect, as it did before) and the
+ * same answer has to be given back to end.  Per task and per call, never for anything else the task does. */
+bool susfs_sus_path_exempt_begin(void);
+void susfs_sus_path_exempt_end(bool taken);
 
 /* The two AArch32 listing numbers, and they live here rather than in sus_path.c because the
  * sys_call_table entries that drive the filter (susfs_kstat.c) have to name them as well: a
@@ -101,6 +114,18 @@ bool susfs_hide_modules_node_ready(void);
  * operator who cannot see the rule table cannot tell "registered" from "hiding"; root-only, everyone else gets ENOENT. */
 #define SUSFS_PATH_NODE "/proc/susfs_path"
 
+/* The uname machine spoof node: rewrites utsname.machine only for processes that map the marker file
+ * (translated arm64 code).  Root-only, ENOENT for everyone else through sus_path. */
+#define SUSFS_UNAME_MACHINE_NODE "/proc/susfs_uname_machine"
+
+/* The per-app property view node (SPIKE): add/clear the real area to copy file pairs.
+ * Root-only, ENOENT for everyone else through sus_path. */
+#define SUSFS_PROP_VIEW_NODE "/proc/susfs_prop_view"
+
+/* sus_map's rule node: add/del/clear the mappings the maps/smaps/map_files walk hides.  Root-only
+ * through the same su-side gate as the other control nodes. */
+#define SUSFS_MAP_NODE "/proc/susfs_map"
+
 /* Whether the /proc/susfs_* control nodes are created at all.  Defaults to TRUE; they are created only when the LSM layer
  * that hides them is installed, so nobody ends up with an unprotected control node, and expose_proc=0 removes them. */
 extern bool susfs_expose_proc;
@@ -108,6 +133,9 @@ extern bool susfs_expose_proc;
 /* feature init/exit (each feature is its own translation unit) */
 int susfs_uname_init(void);
 void susfs_uname_exit(void);
+
+int susfs_prop_view_init(void);
+void susfs_prop_view_exit(void);
 
 int susfs_kstat_init(void);
 void susfs_kstat_exit(void);
@@ -127,6 +155,10 @@ void susfs_spoof_cmdline_exit(void);
 int susfs_open_redirect_init(void);
 void susfs_open_redirect_exit(void);
 
+/* True when current's executable is app_process64 or app_process32, using the same resolved
+ * inodes as the app_only rules.  Used by the prop_view layer. */
+bool susfs_current_exe_is_app_process(void);
+
 int susfs_enable_log_init(void);
 void susfs_enable_log_exit(void);
 bool susfs_log_enabled(void);
@@ -136,6 +168,31 @@ void susfs_avc_spoof_exit(void);
 
 int susfs_supercall_init(void);
 void susfs_supercall_exit(void);
+/* True when the sys_call_table hook could not arm and the supercall is delivered
+ * through the kprobe fallback (see susfs_supercall_init()). */
+bool susfs_supercall_kprobe_active(void);
+
+/* Feature registry for the reboot(2) supercall.  A layer arms its feature only after its init
+ * returned 0, so a non-fatal layer that failed is neither advertised by SHOW_ENABLED_FEATURES
+ * nor allowed to have its commands hijacked (userspace then keeps its ERR_CMD_NOT_SUPPORTED
+ * sentinel).  The reboot kprobe reads the bitmap with test_bit(); the arm happens once, in
+ * process context, before the module can serve a command. */
+enum susfs_feature {
+	SUSFS_FEAT_SUS_PATH = 0,
+	SUSFS_FEAT_SUS_MOUNT,
+	SUSFS_FEAT_SUS_KSTAT,
+	SUSFS_FEAT_SPOOF_UNAME,
+	SUSFS_FEAT_ENABLE_LOG,
+	SUSFS_FEAT_HIDE_SYMS,
+	SUSFS_FEAT_SPOOF_CMDLINE,
+	SUSFS_FEAT_OPEN_REDIRECT,
+	SUSFS_FEAT_SUS_MAP,
+	SUSFS_FEAT_AVC_SPOOF,	/* commands only: no upstream CONFIG_* line for it */
+	SUSFS_FEAT_COUNT,
+};
+
+void susfs_supercall_arm_feature(enum susfs_feature feature);
+bool susfs_supercall_feature_armed(enum susfs_feature feature);
 
 /* feature supercall handlers (upstream signature: void xxx(void __user **arg)) */
 void susfs_uname_supercall(void __user **arg);
@@ -174,6 +231,15 @@ long susfs_opath_post_fd(long ret);
 struct inode;
 bool sus_path_inode_hidden_public(struct inode *inode);
 
+/* Whether any sus_path rule is live right now: the create-family entries test this before
+ * they resolve a path, so an empty table costs one load and nothing else. */
+bool sus_path_rules_present(void);
+
+/* Whether any ordinary (operator-supplied) sus_path rule is live.  Self-protect entries for the
+ * module's own /proc nodes are deliberately excluded: the create family must stay a fast pass
+ * when only those exist. */
+bool sus_path_user_rules_present(void);
+
 /* Whether a 0777 /proc/susfs_* control node may be created.  Two independent conditions, neither optional: susfs_expose_proc
  * (the operator opted in) and sus_path_lsm_active() (with 0777 DAC passes every caller, so only the LSM layer can still
  * answer ENOENT for an app).  This gates node CREATION ONLY, never hook registration: an earlier revision returned early from
@@ -195,10 +261,13 @@ bool susfs_open_redirect_spoof_ids(unsigned long ino, unsigned long *out_ino, un
 /* Asked by the name-layer entry hook (susfs_or_entry.c) for the path a caller is about to open.
  * The redirect target is COPIED into the caller's buffer (buflen >= SUSFS_OR_PATH_MAX) while the
  * lookup runs under rcu_read_lock, and the return value is false when no live rule matches (or the
- * name does not fit).  A pointer into the rule could not be handed out any more: rule slots are
+ * name does not fit).  An app_only rule also requires the caller's exe file to be app_process64 or
+ * app_process32.  A pointer into the rule could not be handed out any more: rule slots are
  * recycled now (a deleted rule's slot is handed out again once a grace period has passed), so
- * nothing inside an entry may be read after the lookup returns. */
-bool susfs_open_redirect_match_path(const struct path *path, char *buf, size_t buflen);
+ * nothing inside an entry may be read after the lookup returns.  On a match, *keep_ident is the
+ * rule's keep_ident flag. */
+bool susfs_open_redirect_match_path(const struct path *path, char *buf, size_t buflen,
+				    bool *keep_ident);
 
 /* How many rules are live right now.  The name-layer hook runs for every open() on the system, so it
  * tests this before it resolves anything - a table with no live rule costs one load instead of a path
@@ -215,5 +284,10 @@ static inline bool susfs_open_redirect_active(void)
  * rules - and on by default (the or_entry parameter can turn it off). */
 int susfs_or_entry_init(void);
 void susfs_or_entry_exit(void);
+
+/* The create family's entry layer (susfs_create_gate.c): answers EACCES for a hidden name
+ * where filename_create() would have answered EEXIST before any LSM hook could run. */
+int susfs_create_gate_init(void);
+void susfs_create_gate_exit(void);
 
 #endif

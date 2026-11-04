@@ -58,11 +58,13 @@
 #include <linux/err.h>
 #include <linux/atomic.h>
 #include <linux/limits.h>
+#include <linux/slab.h>		/* kfree: keep_ident's name, on the paths that list no file */
 #include "susfs.h"
 #include "susfs_log.h"
 #include "symbol_resolver.h"
 #include "susfs_kprobe.h"	/* susfs_sc_arg */
 #include "susfs_or_entry.h"
+#include "susfs_or_ident.h"	/* keep_ident: list the file this redirect serves */
 
 /* include/uapi/linux/openat2.h: three u64 fields, identical on both ABIs we build for. */
 struct susfs_open_how {
@@ -204,6 +206,11 @@ static __nocfi noinline long or_entry_redirect(const struct pt_regs *regs, int k
 	struct path path;
 	char target[SUSFS_OR_PATH_MAX];	/* filled by susfs_open_redirect_match_path() under rcu */
 	struct file *f;
+	bool exempt_taken;
+	bool keep_ident = false;
+	unsigned long src_ino;
+	dev_t src_dev;
+	char *src_name = NULL;
 	int dfd = AT_FDCWD;
 	long res;
 	int fd;
@@ -382,21 +389,35 @@ static __nocfi noinline long or_entry_redirect(const struct pt_regs *regs, int k
 	if (IS_ERR(name))
 		return SUSFS_OR_ENTRY_PASS;
 	res = or_filename_lookup_fn(dfd, name, or_lookup_flags(flags, resolve), &path, NULL);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0)
+	/* filename_lookup() consumed `name` through 5.14; 5.15 made the caller own it.
+	 * Putting it here again double-frees and panics (the create_gate 5.10 KE). */
+#else
 	or_putname_fn(name);
+#endif
 	if (res)
 		return SUSFS_OR_ENTRY_PASS;
 
 	/* The target name is copied out of the rule while the lookup holds rcu_read_lock (rule slots are
 	 * recycled after a grace period, so nothing inside an entry may be used after this call). */
-	if (!susfs_open_redirect_match_path(&path, target, sizeof(target))) {
+	if (!susfs_open_redirect_match_path(&path, target, sizeof(target), &keep_ident)) {
 		path_put(&path);
 		return SUSFS_OR_ENTRY_PASS;
 	}
+	/* The identity a keep_ident file reports: the inode the caller asked for, the same numbers the rule
+	 * matched on and stat() on the path shows. */
+	src_ino = d_inode(path.dentry)->i_ino;
+	src_dev = d_inode(path.dentry)->i_sb->s_dev;
+	/* And the name readlink of the fd would have shown: the file the caller's own open resolved to. */
+	if (keep_ident)
+		src_name = susfs_or_ident_path_name(&path);
 	path_put(&path);	/* no reference is kept anywhere: the rule owns none either */
 	/* Defensive: an empty name is not a path, and filp_open("") resolves to the caller's own
 	 * working directory, i.e. it would hand out an unrelated fd. */
-	if (!target[0])
+	if (!target[0]) {
+		kfree(src_name);
 		return SUSFS_OR_ENTRY_PASS;
+	}
 
 	/* arm64 always opens with O_LARGEFILE (force_o_largefile() is `!IS_ENABLED(CONFIG_ARCH_32BIT_OFF_T)`,
 	 * and the syscall adds it before anything else looks at the flags).  Without it the fd we hand
@@ -417,12 +438,23 @@ static __nocfi noinline long or_entry_redirect(const struct pt_regs *regs, int k
 	 * an EMFILE/ENFILE open then touches nothing at all, where opening first would have created or
 	 * truncated the rule's target and then failed anyway. */
 	fd = or_get_unused_fd_flags_fn(fd_cloexec);
-	if (fd < 0)
+	if (fd < 0) {
+		kfree(src_name);
 		return fd;
+	}
 
+	/* The target is opened in the caller's own process context, so sus_path would answer this
+	 * open ENOENT whenever the target itself is registered - the copy directory of NoEmulator's
+	 * property view is ("add /dev/.prop_view"), and measured on the device the app's getprop then
+	 * read dalvik.vm.heapsize as unset instead of 576m.  Only this one filp_open() is exempt,
+	 * per task and per call: the caller's own open/stat of the same path right after is still
+	 * answered ENOENT.  A full slot array returns false and the open runs as it did before. */
+	exempt_taken = susfs_sus_path_exempt_begin();
 	f = or_filp_open_fn(target, (int)(flags & ~O_CLOEXEC), (umode_t)mode);
+	susfs_sus_path_exempt_end(exempt_taken);
 	if (IS_ERR(f)) {
 		or_put_unused_fd((unsigned)fd);
+		kfree(src_name);
 		return PTR_ERR(f);
 	}
 
@@ -438,6 +470,9 @@ static __nocfi noinline long or_entry_redirect(const struct pt_regs *regs, int k
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
 	or_fsnotify_open(f);
 #endif
+	/* Listed before the fd is visible, so no stat on it can see the redirected identity first. */
+	if (keep_ident)
+		susfs_or_ident_track(f, src_ino, src_dev, src_name);
 	or_fd_install_fn((unsigned)fd, f);
 
 	atomic_inc(&or_entry_hits);
